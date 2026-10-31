@@ -1,14 +1,18 @@
 
 import asyncio
 import os
+import secrets
 import subprocess
 import tempfile
 from pathlib import Path
 
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, FSInputFile
+from aiogram.types import Message, Update, FSInputFile
 
-TOKEN = os.getenv("BOT_TOKEN")
+TOKEN = os.environ["BOT_TOKEN"]
+HOST = os.environ["RENDER_EXTERNAL_HOSTNAME"]
+SECRET = os.getenv("WEBHOOK_SECRET") or secrets.token_urlsafe(32)
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
@@ -17,14 +21,14 @@ dp = Dispatcher()
 @dp.message(F.text == "/start")
 async def start(message: Message):
     await message.answer(
-        "Привет! 🖤 Отправь мне кружочек, "
-        "и я сделаю чёрный фон для твоего видео."
+        "Привет! 🖤 Отправь кружочек, "
+        "и я сделаю чёрный фон!"
     )
 
 
 @dp.message(F.video_note | F.video)
 async def process_video(message: Message):
-    status = await message.answer("⏳ Делаю чёрный фон...")
+    status = await message.answer("⏳ Обрабатываю видео...")
 
     file_id = (
         message.video_note.file_id
@@ -42,7 +46,7 @@ async def process_video(message: Message):
             filters = (
                 "[0:v]scale=640:640:"
                 "force_original_aspect_ratio=increase,"
-                "crop=640:640,setsar=1,format=rgba,"
+                "crop=640:640,format=rgba,"
                 "geq=r='r(X,Y)':g='g(X,Y)':"
                 "b='b(X,Y)':"
                 "a='if(lte(pow(X-W/2,2)+pow(Y-H/2,2),"
@@ -52,43 +56,74 @@ async def process_video(message: Message):
                 "shortest=1,format=yuv420p[outv]"
             )
 
-            command = [
-                "ffmpeg", "-y", "-i", str(src),
-                "-filter_complex", filters,
-                "-map", "[outv]", "-map", "0:a?",
-                "-c:v", "libx264", "-preset", "ultrafast",
-                "-crf", "22", "-c:a", "aac",
-                "-shortest", "-movflags", "+faststart",
-                str(dst)
-            ]
-
             result = subprocess.run(
-                command, capture_output=True, text=True
+                [
+                    "ffmpeg", "-y", "-i", str(src),
+                    "-filter_complex", filters,
+                    "-map", "[outv]", "-map", "0:a?",
+                    "-c:v", "libx264", "-preset", "ultrafast",
+                    "-crf", "23", "-c:a", "aac",
+                    "-shortest", "-movflags", "+faststart",
+                    str(dst)
+                ],
+                capture_output=True,
+                text=True,
+                timeout=180
             )
 
             if result.returncode != 0:
-                raise RuntimeError(result.stderr[-1500:])
+                raise RuntimeError(result.stderr[-1000:])
 
             await message.answer_video(
                 FSInputFile(dst),
                 caption="Готово! 🖤"
             )
 
-            await status.delete()
+        await status.delete()
 
-    except Exception as error:
-        print(error)
-        await status.edit_text(
-            "Не удалось обработать видео. Попробуй ещё раз."
-        )
+    except Exception as e:
+        print("ERROR:", e)
+        await status.edit_text("Ошибка обработки. Попробуй другое видео.")
 
 
-async def main():
-    if not TOKEN:
-        raise RuntimeError("BOT_TOKEN не задан")
+async def webhook(request):
+    if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != SECRET:
+        raise web.HTTPForbidden()
 
-    await dp.start_polling(bot)
+    data = await request.json()
+    update = Update.model_validate(data, context={"bot": bot})
+    await dp.feed_update(bot, update)
+    return web.Response(text="OK")
+
+
+async def health(request):
+    return web.Response(text="Bot is running")
+
+
+async def on_startup(app):
+    await bot.set_webhook(
+        f"https://{HOST}/webhook",
+        secret_token=SECRET,
+        drop_pending_updates=True
+    )
+    print("Webhook started!")
+
+
+async def on_cleanup(app):
+    await bot.delete_webhook()
+    await bot.session.close()
+
+
+app = web.Application()
+app.router.add_post("/webhook", webhook)
+app.router.add_get("/", health)
+app.on_startup.append(on_startup)
+app.on_cleanup.append(on_cleanup)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    web.run_app(
+        app,
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 10000))
+    )
